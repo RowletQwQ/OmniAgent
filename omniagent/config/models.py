@@ -3,7 +3,47 @@
 import os
 from typing import Any, Dict, List, Literal, Optional
 from pathlib import Path
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+_PROVIDER_API_TYPES = {
+    "deepseek",
+    "openai",
+    "anthropic",
+    "ollama",
+    "gemini",
+    "openrouter",
+    "vllm",
+    "sglang",
+    "openai-compatible",
+}
+_API_TYPE_ALIASES = {
+    "custom": "openai-compatible",
+    "openai_compatible": "openai-compatible",
+}
+
+
+def _normalize_api_type(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    return _API_TYPE_ALIASES.get(normalized, normalized)
+
+
+def _ensure_supported_api_type(api_type: Optional[str]) -> Optional[str]:
+    if api_type is None:
+        return None
+    if api_type not in _PROVIDER_API_TYPES:
+        supported = ", ".join(sorted(_PROVIDER_API_TYPES))
+        raise ValueError(f"Unsupported provider api_type {api_type!r}; expected one of: {supported}")
+    return api_type
+
+
+def _default_api_type_for_provider_key(provider_key: str) -> Optional[str]:
+    normalized = _normalize_api_type(provider_key)
+    return normalized if normalized in _PROVIDER_API_TYPES else None
 
 
 class ToolsConfig(BaseModel):
@@ -28,12 +68,16 @@ class ToolsConfig(BaseModel):
 class ProviderConfig(BaseModel):
     """Per-provider configuration (api_key, api_url, default model).
 
-    Used in OmniAgentConfig.providers to define named provider presets
-    that can be selected via agent.model_provider or --provider CLI flag.
+    The providers map key is the provider identity used for selection.
+    api_type selects the implementation/parser.
     """
 
     model_config = ConfigDict(extra="allow")
 
+    api_type: Optional[str] = Field(
+        default=None,
+        description="Provider implementation type (deepseek, openai, anthropic, ollama, gemini, openrouter, vllm, sglang, openai-compatible)"
+    )
     api_key: Optional[str] = Field(
         default=None,
         description="API key for this provider"
@@ -47,15 +91,30 @@ class ProviderConfig(BaseModel):
         description="Default model ID for this provider"
     )
 
+    @field_validator("api_type", mode="before")
+    @classmethod
+    def _normalize_provider_api_type(cls, value: Any) -> Optional[str]:
+        return _ensure_supported_api_type(_normalize_api_type(value))
+
+    @model_validator(mode="before")
+    @classmethod
+    def _strip_legacy_provider_name(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            cleaned = dict(value)
+            cleaned.pop("provider_name", None)
+            return cleaned
+        return value
+
 
 class AgentConfig(BaseModel):
     """Agent configuration."""
 
     model_config = ConfigDict(extra="allow")
 
-    model_provider: Literal["deepseek", "openai", "anthropic", "ollama", "gemini", "openrouter", "vllm", "sglang", "custom"] = Field(
+    model_provider: str = Field(
         default="deepseek",
-        description="LLM provider (deepseek, openai, anthropic, ollama, gemini, openrouter, vllm, sglang, custom)"
+        min_length=1,
+        description="Active provider key from the providers map"
     )
     model_id: str = Field(
         default="deepseek-chat",
@@ -455,7 +514,7 @@ class GuardianConfig(BaseModel):
 class RLConfig(BaseModel):
     """Configuration for Reinforcement Learning (GRPO) training.
 
-    Only activates when model_provider is "vllm" or "sglang".
+    Only activates when api_type is "vllm" or "sglang".
     Controls the FastAPI proxy, PRM scorer, and rollout worker.
     """
 
@@ -610,7 +669,7 @@ class OmniAgentConfig(BaseModel):
     # Named provider presets
     providers: Dict[str, ProviderConfig] = Field(
         default_factory=dict,
-        description="Named LLM provider configs (api_key, api_url, model)"
+        description="Named LLM provider configs keyed by provider identity"
     )
 
     # Working directory
@@ -706,3 +765,94 @@ class OmniAgentConfig(BaseModel):
         default_factory=ChannelsConfig,
         description="Chat channels configuration"
     )
+
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_provider_layout(cls, value: Any) -> Any:
+        """Migrate legacy provider aliases into provider-key identities."""
+        if not isinstance(value, dict):
+            return value
+
+        data = dict(value)
+        providers = data.get("providers")
+        if providers is None:
+            providers = {}
+        elif not isinstance(providers, dict):
+            return data
+
+        agent = data.get("agent")
+        agent_data = dict(agent) if isinstance(agent, dict) else {}
+        active_provider = agent_data.get("model_provider")
+        normalized_providers: Dict[str, Any] = {}
+
+        for raw_key, raw_provider in providers.items():
+            provider_key = str(raw_key)
+            if not isinstance(raw_provider, dict):
+                normalized_providers[provider_key] = raw_provider
+                continue
+
+            provider_data = dict(raw_provider)
+            legacy_name_raw = provider_data.pop("provider_name", None)
+            legacy_name = str(legacy_name_raw).strip() if legacy_name_raw else None
+            api_type = _ensure_supported_api_type(_normalize_api_type(provider_data.get("api_type")))
+            provider_key_api_type = _default_api_type_for_provider_key(provider_key)
+            legacy_name_api_type = _default_api_type_for_provider_key(legacy_name) if legacy_name else None
+            if api_type is not None:
+                provider_data["api_type"] = api_type
+
+            target_key = provider_key
+            if legacy_name and legacy_name != provider_key:
+                conflict = legacy_name in providers or legacy_name in normalized_providers
+                if provider_key_api_type and not conflict:
+                    target_key = legacy_name
+                    if not provider_data.get("api_type"):
+                        provider_data["api_type"] = provider_key_api_type
+                elif not provider_data.get("api_type"):
+                    fallback_api_type = provider_key_api_type or legacy_name_api_type
+                    if fallback_api_type:
+                        provider_data["api_type"] = fallback_api_type
+
+            if not provider_data.get("api_type") and not _default_api_type_for_provider_key(target_key):
+                raise ValueError(f"providers.{target_key}.api_type is required for named provider keys")
+
+            normalized_providers[target_key] = provider_data
+            if active_provider == provider_key and target_key != provider_key:
+                agent_data["model_provider"] = target_key
+
+        if agent_data:
+            data["agent"] = agent_data
+        data["providers"] = normalized_providers
+        cls._validate_active_provider_key(data, normalized_providers)
+        return data
+
+    @staticmethod
+    def _validate_active_provider_key(data: Dict[str, Any], providers: Dict[str, Any]) -> None:
+        agent = data.get("agent")
+        active_provider = "deepseek"
+        if isinstance(agent, dict):
+            raw_active = agent.get("model_provider")
+            if raw_active is not None:
+                active_provider = str(raw_active).strip()
+
+        if not active_provider:
+            return
+        if active_provider in providers:
+            provider_data = providers[active_provider]
+            if isinstance(provider_data, dict):
+                api_type = _ensure_supported_api_type(_normalize_api_type(provider_data.get("api_type")))
+                if api_type is not None:
+                    provider_data["api_type"] = api_type
+                elif not _default_api_type_for_provider_key(active_provider):
+                    raise ValueError(
+                        f"providers.{active_provider}.api_type is required for active named provider key"
+                    )
+            return
+
+        if _default_api_type_for_provider_key(active_provider):
+            return
+
+        raise ValueError(
+            f"agent.model_provider={active_provider!r} requires providers.{active_provider}.api_type; "
+            "use a built-in provider key or add a provider entry with api_type"
+        )
