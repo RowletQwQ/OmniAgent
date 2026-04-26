@@ -7,11 +7,12 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 from omniagent.config import OmniAgentConfig
 from omniagent.gateway.router import IncomingMessage, OutgoingMessage
 from omniagent.infra import get_logger
+from .usage import UsageRecorder, UsageTrackingLLMProvider
 from omniagent.tools import (
     Tool, ToolRegistry, ReadTool, WriteTool, EditTool, BashTool,
     LoadJSONTool, SaveJSONTool, ProcessListTool, ProcessKillTool,
@@ -72,13 +73,13 @@ class ReflexionAgent(Agent):
         self.approval_callback = approval_callback
 
         # Create LLM provider
+        provider_key = config.agent.model_provider
+        provider_model = config.agent.model_id
         if llm_provider is None:
             # Resolve provider-specific overrides
-            provider_name = config.agent.model_provider
-            provider_cfg = config.providers.get(provider_name) if config.providers else None
+            provider_cfg = config.providers.get(provider_key) if config.providers else None
 
             provider_api_url = config.agent.api_url
-            provider_model = config.agent.model_id
             provider_api_key = ""
 
             if provider_cfg:
@@ -96,13 +97,19 @@ class ReflexionAgent(Agent):
             config.agent.model_id = provider_model
 
             llm_provider = create_llm_provider(
-                provider=provider_name,
+                provider=provider_key,
                 api_key=provider_api_key,
                 model=provider_model,
                 api_url=provider_api_url,
             )
 
-        self.llm = llm_provider
+        self.usage_recorder = UsageRecorder(self.work_dir / ".omniagent" / "usage.db")
+        self.llm = cast(LLMProvider, UsageTrackingLLMProvider(
+            llm_provider,
+            recorder=self.usage_recorder,
+            default_provider=provider_key,
+            default_model=provider_model,
+        ))
 
         # Agent subsystems
         self.event_bus = EventBus()
