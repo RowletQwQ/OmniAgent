@@ -1,6 +1,7 @@
 """REST API handlers for OmniAgent gateway."""
 
 import time
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional
@@ -10,6 +11,11 @@ from aiohttp import web
 from omniagent.config.loader import DEFAULT_CONFIG_PATH, deep_merge, load_config, save_config
 from omniagent.infra import get_logger
 from omniagent.config.models import OmniAgentConfig
+from omniagent.agents.usage import (
+    enrich_usage_summary_with_pricing,
+    load_models_dev_catalog,
+    load_models_dev_pricing_catalog,
+)
 
 if TYPE_CHECKING:
     from omniagent.agents.reflexion import ReflexionAgent
@@ -17,6 +23,8 @@ if TYPE_CHECKING:
     from omniagent.channels.manager import ChannelManager
 
 logger = get_logger(__name__)
+
+MAX_USAGE_SUMMARY_LIMIT = 500
 
 # ── Sensitive field masking ────────────────────────────────────
 
@@ -105,8 +113,15 @@ async def update_config(request: web.Request) -> web.Response:
             status=400,
         )
 
-    # Deep merge
+    # Deep merge. pricing_overrides is a keyed rule map, so replace it as a
+    # whole when provided; otherwise removing a rate in the UI would leave stale
+    # nested keys behind from the old saved config.
     current = ctx.config.model_dump(mode="json")
+    usage_updates = updates.get("usage")
+    if isinstance(usage_updates, dict) and isinstance(usage_updates.get("pricing_overrides"), dict):
+        current_usage = current.get("usage")
+        if isinstance(current_usage, dict):
+            current_usage["pricing_overrides"] = {}
     merged = deep_merge(current, updates)
 
     try:
@@ -371,6 +386,102 @@ async def get_health(request: web.Request) -> web.Response:
 # ── Skills Handlers ───────────────────────────────────────────
 
 
+def _get_usage_config(ctx: APIContext):
+    return ctx.config.usage if ctx.config is not None else OmniAgentConfig().usage
+
+
+async def get_usage_summary(request: web.Request) -> web.Response:
+    """GET /api/usage/summary -- aggregate LLM usage by provider/model."""
+    ctx: APIContext = request.app["api_ctx"]
+    recorder = getattr(ctx.agent, "usage_recorder", None) if ctx.agent is not None else None
+    if recorder is None:
+        return web.json_response({
+            "usage": {
+                "totals": {},
+                "by_model": [],
+                "dropped_events": 0,
+                "failed_events": 0,
+            }
+        })
+
+    if ctx.config is not None:
+        usage_summary_max_days = ctx.config.gateway.usage_summary_max_days
+    else:
+        usage_summary_max_days = OmniAgentConfig().gateway.usage_summary_max_days
+
+    days = None
+    days_raw = request.query.get("days")
+    if days_raw:
+        try:
+            days = int(days_raw)
+        except ValueError:
+            return web.json_response({"error": "days must be an integer"}, status=400)
+        if days <= 0:
+            return web.json_response({"error": "days must be positive"}, status=400)
+        if days > usage_summary_max_days:
+            return web.json_response(
+                {"error": f"days must be <= {usage_summary_max_days}"},
+                status=400,
+            )
+
+    limit = 50
+    limit_raw = request.query.get("limit")
+    if limit_raw:
+        try:
+            limit = int(limit_raw)
+        except ValueError:
+            return web.json_response({"error": "limit must be an integer"}, status=400)
+        if limit <= 0:
+            return web.json_response({"error": "limit must be positive"}, status=400)
+        if limit > MAX_USAGE_SUMMARY_LIMIT:
+            limit = MAX_USAGE_SUMMARY_LIMIT
+
+    usage_config = _get_usage_config(ctx)
+
+    try:
+        summary = recorder.summary(days=days, limit=limit)
+        pricing_catalog = {}
+        if usage_config.pricing_catalog_enabled:
+            pricing_catalog = load_models_dev_pricing_catalog(
+                source_url=usage_config.pricing_catalog_url,
+                timeout_seconds=usage_config.pricing_request_timeout_seconds,
+                cache_ttl_seconds=usage_config.pricing_cache_ttl_seconds,
+            )
+        summary = enrich_usage_summary_with_pricing(
+            summary,
+            pricing_catalog,
+            overrides=usage_config.pricing_overrides,
+        )
+    except Exception as e:
+        logger.warning("usage_summary_failed", error=str(e))
+        return web.json_response({"error": "Failed to load usage summary"}, status=500)
+
+    return web.json_response({"usage": summary})
+
+
+async def get_external_models(request: web.Request) -> web.Response:
+    """GET /api/admin/models/external -- proxy the external model catalog."""
+    ctx: APIContext = request.app["api_ctx"]
+    usage_config = _get_usage_config(ctx)
+
+    try:
+        catalog = load_models_dev_catalog(
+            source_url=usage_config.pricing_catalog_url,
+            timeout_seconds=usage_config.pricing_request_timeout_seconds,
+            cache_ttl_seconds=usage_config.pricing_cache_ttl_seconds,
+        )
+    except Exception as e:
+        logger.warning("external_models_failed", error=str(e))
+        return web.json_response({"error": "Failed to load external models"}, status=502)
+
+    if not catalog:
+        return web.json_response({"error": "External models unavailable"}, status=502)
+    return web.json_response(catalog)
+
+
+# ── Skills Handlers ───────────────────────────────────────────
+
+
 async def list_skills(request: web.Request) -> web.Response:
     """GET /api/skills -- list discovered skills."""
     ctx: APIContext = request.app["api_ctx"]
@@ -525,6 +636,8 @@ def create_api_router(ctx: APIContext) -> List[web.RouteDef]:
         web.delete("/api/sessions/{session_id}", delete_session),
         # Health
         web.get("/api/health", get_health),
+        web.get("/api/usage/summary", get_usage_summary),
+        web.get("/api/admin/models/external", get_external_models),
         # Skills
         web.get("/api/skills", list_skills),
         web.get("/api/skills/{skill_name}", get_skill),
