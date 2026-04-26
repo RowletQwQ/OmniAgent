@@ -1093,14 +1093,25 @@ class LocalInferenceLLMProvider(OpenAILLMProvider):
             await client.close()
 
 
+def _normalize_provider_api_type(provider: str) -> str:
+    normalized = str(provider or "deepseek").strip().lower()
+    if normalized in {"custom", "openai_compatible"}:
+        return "openai-compatible"
+    return normalized
+
+
 def create_llm_provider(
     provider: str = "deepseek",
     api_key: str = "",
     model: str = "",
     api_url: str = None,
 ) -> LLMProvider:
-    """Factory function to create an LLM provider instance."""
-    provider = provider.lower()
+    """Factory function to create an LLM provider instance.
+
+    The provider argument is an implementation type, not necessarily the
+    user-facing provider key from config.providers.
+    """
+    provider = _normalize_provider_api_type(provider)
 
     if provider == "deepseek":
         return DeepSeekLLMProvider(api_key=api_key, model=model or "deepseek-chat", api_url=api_url or "https://api.deepseek.com/v1")
@@ -1121,9 +1132,9 @@ def create_llm_provider(
             api_key=api_key or "not-needed",
             model=model or "default",
         )
-    elif provider == "custom":
+    elif provider == "openai-compatible":
         if not api_url:
-            raise ValueError("Custom provider requires api_url to be set (e.g. in config: providers.custom.api_url)")
+            raise ValueError("Provider api_type=openai-compatible requires api_url to be set")
         return OpenAILLMProvider(api_key=api_key, model=model or "default", api_url=api_url)
     else:
-        raise ValueError(f"Unknown LLM provider: {provider}")
+        raise ValueError(f"Unknown LLM provider api_type: {provider}")
