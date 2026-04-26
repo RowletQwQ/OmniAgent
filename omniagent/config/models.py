@@ -3,7 +3,10 @@
 import os
 from typing import Any, Dict, List, Literal, Optional
 from pathlib import Path
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+_ALLOWED_PRICING_OVERRIDE_RATES = {"input", "output", "cache_read"}
 
 
 class ToolsConfig(BaseModel):
@@ -210,6 +213,61 @@ class GatewayConfig(BaseModel):
         gt=0,
         description="Session timeout in seconds"
     )
+    usage_summary_max_days: int = Field(
+        default=365,
+        ge=1,
+        description="Maximum days accepted by /api/usage/summary"
+    )
+
+
+class UsageConfig(BaseModel):
+    """Usage accounting configuration."""
+
+    model_config = ConfigDict(extra="allow")
+
+    pricing_catalog_enabled: bool = Field(
+        default=True,
+        description="Use the default model pricing catalog for usage cost estimates"
+    )
+    pricing_catalog_url: str = Field(
+        default="https://models.dev/api.json",
+        description="Default model pricing catalog URL"
+    )
+    pricing_cache_ttl_seconds: int = Field(
+        default=900,
+        ge=0,
+        description="Seconds to cache fetched model pricing data"
+    )
+    pricing_request_timeout_seconds: float = Field(
+        default=2.0,
+        gt=0,
+        description="Timeout for fetching default model pricing data"
+    )
+    pricing_overrides: Dict[str, Dict[str, float]] = Field(
+        default_factory=dict,
+        description="Manual pricing overrides keyed by 'provider/model_id'. Supported rates are input, output, and cache_read, in USD per million tokens"
+    )
+
+    @field_validator("pricing_overrides", mode="before")
+    @classmethod
+    def _sanitize_pricing_overrides(cls, value: Any) -> Any:
+        """Drop unsupported pricing keys before config is exposed or saved."""
+        if value is None or not isinstance(value, dict):
+            return value
+
+        sanitized: Dict[str, Any] = {}
+        for rule_key, rule in value.items():
+            if not isinstance(rule, dict):
+                sanitized[str(rule_key)] = rule
+                continue
+            filtered = {
+                rate_key: rate
+                for rate_key, rate in rule.items()
+                if rate_key in _ALLOWED_PRICING_OVERRIDE_RATES
+            }
+            if filtered:
+                sanitized[str(rule_key)] = filtered
+        return sanitized
 
 
 class ChannelsConfig(BaseModel):
@@ -645,6 +703,10 @@ class OmniAgentConfig(BaseModel):
     gateway: GatewayConfig = Field(
         default_factory=GatewayConfig,
         description="Gateway configuration"
+    )
+    usage: UsageConfig = Field(
+        default_factory=UsageConfig,
+        description="Usage accounting configuration"
     )
 
     # Feature flags
