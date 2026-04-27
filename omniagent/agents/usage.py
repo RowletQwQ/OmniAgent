@@ -39,10 +39,6 @@ def _as_float(value: Any) -> Optional[float]:
     return parsed if parsed >= 0 else None
 
 
-def _pricing_key(provider: str, model_id: str) -> str:
-    return f"{provider}/{model_id}"
-
-
 def _normalize_pricing_entry(
     cost: Dict[str, Any],
     source: str,
@@ -123,7 +119,7 @@ def load_models_dev_pricing_catalog(
             pricing = _normalize_pricing_entry(cost, "models.dev")
             if pricing:
                 model_key = str(model_id)
-                catalog[_pricing_key(str(provider_id), model_key)] = pricing
+                catalog[f"{provider_id}/{model_key}"] = pricing
                 existing = model_catalog.get(model_key)
                 if existing is None:
                     model_catalog[model_key] = pricing
@@ -149,8 +145,8 @@ def _lookup_pricing(
     model_id = str(model_id or "unknown")
     aliased_provider = _PROVIDER_ALIASES.get(provider, provider)
     candidates = [
-        _pricing_key(provider, model_id),
-        _pricing_key(aliased_provider, model_id),
+        f"{provider}/{model_id}",
+        f"{aliased_provider}/{model_id}",
         model_id,
     ]
 
@@ -287,18 +283,6 @@ def _as_int(value: Any) -> int:
     return parsed if parsed > 0 else 0
 
 
-def _nested_int(data: Dict[str, Any], parent: str, child: str) -> int:
-    nested = data.get(parent)
-    if isinstance(nested, dict):
-        return _as_int(nested.get(child))
-    return 0
-
-
-def _local_today_start_unix() -> float:
-    now = datetime.now().astimezone()
-    return now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-
-
 def normalize_usage(
     usage: Optional[Dict[str, Any]],
     metadata: Optional[Dict[str, Any]] = None,
@@ -318,7 +302,8 @@ def normalize_usage(
         raw_usage.get("output_tokens", raw_usage.get("completion_tokens"))
     )
 
-    nested_cached = _nested_int(raw_usage, "prompt_tokens_details", "cached_tokens")
+    _details = raw_usage.get("prompt_tokens_details")
+    nested_cached = _as_int(_details.get("cached_tokens")) if isinstance(_details, dict) else 0
     cached_input_tokens = _as_int(
         raw_usage.get(
             "cached_input_tokens",
@@ -521,18 +506,15 @@ class UsageRecorder:
         )
 
     def summary(self, days: Optional[int] = None, limit: int = 50) -> Dict[str, Any]:
-        """Return aggregate usage grouped by provider/model.
-
-        When days is omitted, the summary defaults to the local calendar day
-        starting at 00:00. Explicit days values keep their rolling-window
-        meaning and are validated by API callers.
-        """
+        """Return aggregate usage grouped by provider/model."""
         self._ensure_schema(self.db_path)
         safe_limit = max(1, min(limit, 500))
         where = "WHERE created_at_unix >= ?"
         if days is None:
             window_label = "today"
-            params: List[Any] = [_local_today_start_unix()]
+            _now = datetime.now().astimezone()
+            _local_today_start_unix = _now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            params: List[Any] = [_local_today_start_unix]
         else:
             window_label = f"last_{days}_days"
             params = [time.time() - days * 86400]
@@ -586,18 +568,6 @@ class UsageRecorder:
         finally:
             conn.close()
 
-    def close(self) -> None:
-        """Stop the background writer after queued events drain opportunistically."""
-        if not self._enabled:
-            return
-        self._stop_event.set()
-        try:
-            self._queue.put_nowait(None)
-        except queue.Full:
-            self.dropped_events += 1
-            logger.debug("usage_close_signal_dropped", reason="queue_full")
-
-
 class UsageTrackingLLMProvider:
     """LLMProvider proxy that records usage without blocking LLM responses."""
 
@@ -617,18 +587,9 @@ class UsageTrackingLLMProvider:
             default={},
         )
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.inner, name)
-
     @property
     def supports_native_function_calling(self) -> bool:
         return self.inner.supports_native_function_calling
-
-    def set_usage_context(self, context: Dict[str, Any]) -> Token:
-        return self._context.set(dict(context))
-
-    def reset_usage_context(self, token: Token) -> None:
-        self._context.reset(token)
 
     async def chat(
         self,
@@ -655,15 +616,3 @@ class UsageTrackingLLMProvider:
         )
         return response
 
-    async def chat_stream(
-        self,
-        messages: List[Any],
-        temperature: float = 0.7,
-        max_tokens: int = 4096,
-    ) -> AsyncIterator[str]:
-        async for chunk in self.inner.chat_stream(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        ):
-            yield chunk
